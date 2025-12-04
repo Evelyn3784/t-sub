@@ -1,0 +1,105 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Telegram Mass Join — UI</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    body { font-family: Arial, sans-serif; margin: 10px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .panel { border: 1px solid #ddd; padding: 10px; border-radius: 6px; background: #fff; }
+    .full { grid-column: 1 / -1; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 6px; border-bottom: 1px solid #eee; text-align: left; }
+    .log { height: 300px; overflow: auto; background: #111; color: #eee; padding: 8px; font-family: monospace; font-size: 12px; }
+    button { padding: 8px 12px; }
+    .small { font-size: 12px; color: #666; }
+    a.link { color: #1a73e8; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h2>Telegram MassJoin / Unsubscribe — UI</h2>
+
+  <div class="grid">
+    <div class="panel">
+      <h3>Управление</h3>
+      <div>
+        <label>Задержка между аккаунтами (секунды) — min / max:</label><br />
+        <input id="delay_min" type="number" value="5" min="1" style="width:70px" /> —
+        <input id="delay_max" type="number" value="60" min="1" style="width:70px" />
+        <div class="small">Рандомная задержка между действиями каждого аккаунта (применяется для подписки/проверки/отписки).</div>
+      </div>
+      <div style="margin-top:8px;">
+        <label>Проверки (минуты) — отложенная проверка после завершения подписки:</label><br />
+        <input id="check_minutes" type="number" value="60" min="0" style="width:100px" />
+        <div class="small">Через сколько минут запустить проверку членства после завершения фазы Подписки (0 — немедленно).</div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <button id="btnStart">Запустить Подписку</button>
+        <button id="btnPause">Пауза</button>
+        <button id="btnResume">Возобновить</button>
+        <button id="btnStop">Остановить</button>
+      </div>
+
+      <div style="margin-top:10px;">
+        <button id="btnCheckNow">Проверить подписку сейчас</button>
+        <button id="btnStopCheck">Остановить проверку</button>
+      </div>
+
+      <div style="margin-top:10px;">
+        <button id="btnUnsub">Отписаться (Unsubscribe)</button>
+        <button id="btnStopUnsub">Остановить отписку</button>
+      </div>
+
+      <div style="margin-top:10px;">
+        <button id="btnDownloadGood">Скачать good_targets.csv</button>
+        <button id="btnClearGood">Очистить good_targets.csv</button>
+      </div>
+
+      <div style="margin-top:10px;">
+        <button id="btnExportLogs">Экспорт логов</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Статистика</h3>
+      <div id="statusBlock">
+        <div>Running: <span id="running">false</span></div>
+        <div>Subscribe progress: <span id="subscribe_progress">0%</span></div>
+        <div>Check progress: <span id="check_progress">0%</span></div>
+        <div>Targets total: <span id="total_targets">0</span></div>
+        <div>Attempted: <span id="attempted">0</span></div>
+        <div>Approved (positive checks): <span id="approved">0</span></div>
+      </div>
+    </div>
+
+    <div class="panel full">
+      <h3>Аккаунты (cooldown / last_action)</h3>
+      <table id="accountsTable">
+        <thead><tr><th>Account</th><th>Authorized</th><th>Cooldown (s)</th><th>Last action</th></tr></thead>
+        <tbody id="accountsBody"></tbody>
+      </table>
+    </div>
+
+    <div class="panel full">
+      <h3>Прогресс по целям (targets) и аккаунтам</h3>
+      <div id="progressTableWrap" style="max-height:300px; overflow:auto;">
+        <table id="progressTable">
+          <thead id="progressHead"></thead>
+          <tbody id="progressBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel full">
+      <h3>Лог (живой)</h3>
+      <div class="log" id="logArea"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
