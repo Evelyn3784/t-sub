@@ -1,102 +1,116 @@
-<!-- templates/index.html -->
 <!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Telegram Mass Join — UI</title>
+  <title>Telegram MassJoin / Manager</title>
   <link rel="stylesheet" href="/static/style.css" />
   <style>
-    body { font-family: Arial, sans-serif; margin: 10px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .panel { border: 1px solid #ddd; padding: 10px; border-radius: 6px; background: #fff; }
-    .full { grid-column: 1 / -1; }
-    table { width: 100%; border-collapse: collapse; font-size: 14px; }
-    th, td { padding: 6px; border-bottom: 1px solid #eee; text-align: left; }
-    .log { height: 300px; overflow: auto; background: #111; color: #eee; padding: 8px; font-family: monospace; font-size: 12px; }
-    button { padding: 8px 12px; }
-    .small { font-size: 12px; color: #666; }
-    a.link { color: #1a73e8; text-decoration: none; }
+    /* Простейшая стилизация — вы можете заменить style.css */
+    body { font-family: Inter, Arial, sans-serif; margin: 12px; background:#f6f7fb; color:#222; }
+    h2 { margin: 6px 0 12px 0; }
+    .grid { display: grid; grid-template-columns: 420px 1fr; gap: 12px; align-items: start; }
+    .panel { background: #fff; border-radius: 8px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .panel h3 { margin-top:0; font-size:16px; }
+    label { display:block; margin-top:8px; font-size:13px; color:#444; }
+    input[type="text"], input[type="number"], select { padding:6px 8px; border-radius:6px; border:1px solid #ddd; width:100%; box-sizing:border-box; }
+    button { padding:8px 12px; border-radius:6px; border:0; background:#2b6ef6; color:#fff; cursor:pointer; margin-right:6px }
+    button.ghost { background:#e6e9f2; color:#111 }
+    table { width:100%; border-collapse: collapse; margin-top:8px; font-size:13px; }
+    th, td { padding:8px 6px; border-bottom:1px solid #f0f2f7; text-align:left; vertical-align:middle; }
+    .log { height:260px; overflow:auto; background:#0f1720; color:#e6eef8; padding:8px; border-radius:6px; font-family:monospace; font-size:12px; }
+    .small { font-size:12px; color:#666; margin-top:6px; }
+    .controls { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+    .muted { color:#666; font-size:12px; }
+    .link { color:#1a73e8; text-decoration:none }
   </style>
 </head>
 <body>
-  <h2>Telegram MassJoin / Unsubscribe — UI</h2>
+  <h2>Telegram MassJoin — Управление</h2>
 
   <div class="grid">
     <div class="panel">
-      <h3>Управление</h3>
-      <div>
-        <label>Задержка между аккаунтами (секунды) — min / max:</label><br />
-        <input id="delay_min" type="number" value="5" min="1" style="width:70px" /> —
-        <input id="delay_max" type="number" value="60" min="1" style="width:70px" />
-        <div class="small">Рандомная задержка между действиями каждого аккаунта (применяется для подписки/проверки/отписки).</div>
-      </div>
-      <div style="margin-top:8px;">
-        <label>Проверки (минуты) — отложенная проверка после завершения подписки:</label><br />
-        <input id="check_minutes" type="number" value="60" min="0" style="width:100px" />
-        <div class="small">Через сколько минут запустить проверку членства после завершения фазы Подписки (0 — немедленно).</div>
-      </div>
+      <h3>Быстрые настройки и управление</h3>
 
-      <div style="margin-top:10px;">
+      <label>Задержка между действиями (сек) — min / max</label>
+      <div style="display:flex; gap:6px;">
+        <input id="delay_min" type="number" value="5" min="1" style="width:110px" />
+        <input id="delay_max" type="number" value="60" min="1" style="width:110px" />
+      </div>
+      <div class="small">Задайте диапазон задержек; для каждого действия аккаунта будет случайная пауза в пределах диапазона.</div>
+
+      <label>Отложенная проверка (минуты)</label>
+      <input id="check_minutes" type="number" value="60" min="0" />
+      <div class="small">Через сколько минут после завершения фазы «Подписаться» будет запущена проверка (0 — немедленно).</div>
+
+      <div class="controls" style="margin-top:10px;">
         <button id="btnStart">Запустить Подписку</button>
-        <button id="btnPause">Пауза</button>
-        <button id="btnResume">Возобновить</button>
-        <button id="btnStop">Остановить</button>
+        <button id="btnPause" class="ghost">Пауза</button>
+        <button id="btnResume" class="ghost">Возобновить</button>
+        <button id="btnStop" class="ghost">Остановить</button>
       </div>
 
-      <div style="margin-top:10px;">
+      <div class="controls" style="margin-top:8px;">
         <button id="btnCheckNow">Проверить подписку сейчас</button>
-        <button id="btnStopCheck">Остановить проверку</button>
+        <button id="btnStopCheck" class="ghost">Остановить проверку</button>
+      </div>
+
+      <div class="controls" style="margin-top:8px;">
+        <button id="btnUnsub">Массовая отписка</button>
+        <button id="btnStopUnsub" class="ghost">Остановить отписку</button>
       </div>
 
       <div style="margin-top:10px;">
-        <button id="btnUnsub">Отписаться (Unsubscribe)</button>
-        <button id="btnStopUnsub">Остановить отписку</button>
+        <button id="btnDownloadGood" class="ghost">Скачать good_targets.csv</button>
+        <button id="btnClearGood" class="ghost">Перезаписать good_targets.csv</button>
+        <button id="btnExportLogs" class="ghost">Экспорт логов (.txt)</button>
       </div>
 
-      <div style="margin-top:10px;">
-        <button id="btnDownloadGood">Скачать good_targets.csv</button>
-        <button id="btnClearGood">Очистить good_targets.csv</button>
+      <div style="margin-top:12px;">
+        <h3 style="margin-bottom:6px;">Загрузить .session</h3>
+        <form id="uploadForm" onsubmit="return false;">
+          <label>Файл .session</label>
+          <input id="fileInput" type="file" accept=".session,.db,.sqlite" />
+          <label>Имя аккаунта (name)</label>
+          <input id="session_name" type="text" placeholder="acc1" />
+          <label>API_ID (обязательно)</label>
+          <input id="session_api_id" type="text" placeholder="123456" />
+          <label>API_HASH (обязательно)</label>
+          <input id="session_api_hash" type="text" placeholder="abcdef..." />
+          <div class="controls" style="margin-top:8px;">
+            <button id="btnUpload">Загрузить .session</button>
+          </div>
+          <div class="small">При загрузке обязательно укажите API_ID и API_HASH. Если не указать — загрузка не будет принята.</div>
+        </form>
       </div>
 
-      <div style="margin-top:10px;">
-        <button id="btnExportLogs">Экспорт логов</button>
+      <div style="margin-top:12px;">
+        <h3 style="margin-bottom:6px;">Аккаунты</h3>
+        <table>
+          <thead><tr><th>Account</th><th>Авториз.</th><th>Cooldown</th><th>Last action</th></tr></thead>
+          <tbody id="accountsBody"><tr><td colspan="4" class="muted">Данные загружаются...</td></tr></tbody>
+        </table>
       </div>
+
     </div>
 
     <div class="panel">
-      <h3>Статистика</h3>
-      <div id="statusBlock">
-        <div>Running: <span id="running">false</span></div>
-        <div>Subscribe progress: <span id="subscribe_progress">0%</span></div>
-        <div>Check progress: <span id="check_progress">0%</span></div>
-        <div>Targets total: <span id="total_targets">0</span></div>
-        <div>Attempted: <span id="attempted">0</span></div>
-        <div>Approved (positive checks): <span id="approved">0</span></div>
-      </div>
-    </div>
-
-    <div class="panel full">
-      <h3>Аккаунты (cooldown / last_action)</h3>
-      <table id="accountsTable">
-        <thead><tr><th>Account</th><th>Authorized</th><th>Cooldown (s)</th><th>Last action</th></tr></thead>
-        <tbody id="accountsBody"></tbody>
-      </table>
-    </div>
-
-    <div class="panel full">
-      <h3>Прогресс по целям (targets) и аккаунтам</h3>
-      <div id="progressTableWrap" style="max-height:300px; overflow:auto;">
+      <h3>Прогресс по целям и аккаунтам</h3>
+      <div id="progressTableWrap" style="max-height:360px; overflow:auto;">
         <table id="progressTable">
           <thead id="progressHead"></thead>
           <tbody id="progressBody"></tbody>
         </table>
       </div>
-    </div>
 
-    <div class="panel full">
-      <h3>Лог (живой)</h3>
-      <div class="log" id="logArea"></div>
+      <h3 style="margin-top:10px;">Загруженные .session</h3>
+      <table>
+        <thead><tr><th>Filename</th><th>Name</th><th>API_ID</th><th>Exists</th><th>Действия</th></tr></thead>
+        <tbody id="uploadedSessionsBody"><tr><td colspan="5" class="muted">Нет загруженных файлов</td></tr></tbody>
+      </table>
+
+      <h3 style="margin-top:10px;">Лог (живой)</h3>
+      <div class="log" id="logArea">Ожидание событий...</div>
     </div>
   </div>
 

@@ -2,21 +2,18 @@
 """
 Основной модуль FastAPI + Telethon.
 
-Ключевые улучшения в этой версии:
-- Подписка/Проверка/Отписка выполняются как набор worker'ов — по одному воркеру на аккаунт.
-  Каждый аккаунт хранит свою позицию в списке targets и возобновляет работу с того же места
-  после cooldown или после паузы/возобновления.
-- Отложенная проверка (membership_check_minutes) теперь запускается строго через указанное время
-  после завершения фазы "Подписка". Проверка дополняет existing good_targets.csv (не перезаписывает).
-- Общая задержка (min/max) задаётся в UI и применяется ко всем фазам.
-- Синхронизация обновления shared state осуществляется через asyncio.Lock (state['_lock']).
-- WebSocket push (статус/логи) сохранён — UI получает события в режиме push.
-- Self-ping (автопинг) интегрирован в приложение: при включении через env переменные
-  приложение само будет делать GET-запросы к указанному URL через указанный интервал,
-  чтобы предотвратить "засыпание" на бесплатных тарифах.
-
-Комментарии в коде — на русском языке.
+Изменения и возможности в этом файле:
+- Поддержка .session файлов: можно загружать .session через UI (/api/upload_session),
+  metadata сохраняется в DATA_DIR/sessions_meta.json и затем используются при создании клиентов.
+  Это позволяет использовать аккаунты без генерации string-session и ввода кода.
+- Сохранена поддержка session_string (StringSession) из .env (SESSION_STRING_1..., SESSIONS, SESSION_STRING).
+- Self-ping (автопинг) реализован: при старте, если в env включен SELF_PING_ENABLED и указан SELF_PING_URL,
+  запускается фоновой таск, который будет пинговать указанный URL.
+- WebSocket push для логов и статуса.
+- Все предыдущие функции подписки/проверки/отписки/позиции/cooldown сохранены.
+- Комментарии на русском языке.
 """
+
 import asyncio
 import os
 import re
@@ -27,7 +24,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Set, Callable
 
 import requests
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Form, HTTPException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Form, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -49,6 +46,14 @@ DATA_DIR = os.getenv("DATA_DIR", ".")
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR, exist_ok=True)
 
+# Папка где будут храниться загруженные .session файлы
+SESSIONS_UPLOAD_DIR = os.path.join(DATA_DIR, "sessions")
+if not os.path.exists(SESSIONS_UPLOAD_DIR):
+    os.makedirs(SESSIONS_UPLOAD_DIR, exist_ok=True)
+
+# Мета-файл для загруженных сессий: список объектов {"filename","api_id","api_hash","name"}
+SESSIONS_META_FILE = os.path.join(DATA_DIR, "sessions_meta.json")
+
 TARGETS_FILE = os.path.join(DATA_DIR, "targets.csv")
 GOOD_TARGETS_FILE = os.path.join(DATA_DIR, "good_targets.csv")
 LOG_FILE = os.path.join(DATA_DIR, "logs.txt")
@@ -60,8 +65,6 @@ LOG_MAX_LINES = 1000
 # SELF_PING_ENABLED - true/false
 # SELF_PING_URL - URL, который будет пинговаться (например https://<app>.onrender.com/api/accounts_status)
 # SELF_PING_INTERVAL - интервал в секундах (рекомендуется >= 20)
-# Self-ping использует requests (блокирующий) внутри asyncio.to_thread.
-# Логи self-ping идут в общий лог через append_log.
 # -------------------------
 
 # -------------------------
@@ -99,7 +102,7 @@ state: Dict[str, Any] = {
     "cooldowns": {},  # name -> unix_timestamp
     "check_task": None,
     "unsubscribe_task": None,
-    "accounts_meta": {},  # name -> {"last_action": "..."}
+    "accounts_meta": {},  # name -> {"last_action": "..." }
     "unsubscribe_pending": {},
     # позиции для каждого аккаунта в каждой фазе
     "positions_subscribe": {},   # name -> idx
@@ -126,6 +129,7 @@ def append_log(msg: str, force_send: bool = False):
     """Добавляет строку в лог, сохраняет на диск и отправляет всем ws логам."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
+    # избегаем повторов подряд
     if state["logs"] and state["logs"][-1] == line and not force_send:
         return
     state["logs"].append(line)
@@ -162,7 +166,7 @@ def broadcast_status():
 
 
 # -------------------------
-# Helpers: files / env
+# Helpers: files / env / sessions meta
 # -------------------------
 def load_targets(path: str = TARGETS_FILE) -> pd.DataFrame:
     if not os.path.exists(path):
@@ -171,9 +175,40 @@ def load_targets(path: str = TARGETS_FILE) -> pd.DataFrame:
     return df
 
 
+def _read_sessions_meta() -> List[Dict[str, str]]:
+    """Читает sessions_meta.json если есть — возвращает список записей."""
+    if not os.path.exists(SESSIONS_META_FILE):
+        return []
+    try:
+        with open(SESSIONS_META_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
+    except Exception:
+        return []
+
+
+def _write_sessions_meta(lst: List[Dict[str, str]]):
+    """Записывает мета-файл для загруженных сессий."""
+    try:
+        with open(SESSIONS_META_FILE, "w", encoding="utf-8") as f:
+            json.dump(lst, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        append_log(f"Ошибка записи sessions_meta.json: {e}")
+
+
 def load_sessions_from_env() -> List[Dict[str, str]]:
-    """Читаем сессии из env. Поддерживаем SESSION_STRING_1/... и SESSIONS (многострочный)."""
+    """
+    Читаем сессии из env и из загруженных .session:
+    - поддерживаем SESSION_STRING_1/... и SESSIONS (многострочный) и SESSION_STRING (как ранее)
+    - дополняем список записями из sessions_meta.json (каждая запись должна содержать filename, api_id, api_hash, name).
+    Возвращаем список элементов с полями:
+      - либо {"session_string": "...", "api_id":"...", "api_hash":"...", "name":"..."}
+      - либо {"session_file": "/full/path/to/file.session", "api_id":"...", "api_hash":"...", "name":"..."}
+    """
     sessions = []
+    # 1) SESSION_STRING_1, API_ID_1, API_HASH_1, SESSION_NAME_1 ...
     i = 1
     while True:
         key = f"SESSION_STRING_{i}"
@@ -188,6 +223,7 @@ def load_sessions_from_env() -> List[Dict[str, str]]:
         sessions.append({"session_string": session_string, "api_id": api_id.strip(), "api_hash": api_hash.strip(), "name": name.strip()})
         i += 1
 
+    # 2) блок SESSIONS — многострочный, каждая строка: session_string,api_id,api_hash[,name]
     sess_block = os.getenv("SESSIONS")
     if sess_block:
         for ln in sess_block.splitlines():
@@ -202,6 +238,7 @@ def load_sessions_from_env() -> List[Dict[str, str]]:
             name = parts[3] if len(parts) >= 4 else f"env_acc_{len(sessions)+1}"
             sessions.append({"session_string": session_string, "api_id": api_id, "api_hash": api_hash, "name": name})
 
+    # 3) единичные переменные SESSION_STRING, API_ID, API_HASH
     if not sessions:
         ss = os.getenv("SESSION_STRING")
         aid = os.getenv("API_ID")
@@ -210,8 +247,29 @@ def load_sessions_from_env() -> List[Dict[str, str]]:
         if ss and aid and ah:
             sessions.append({"session_string": ss.strip(), "api_id": aid.strip(), "api_hash": ah.strip(), "name": name.strip()})
 
+    # 4) Загруженные .session файлы (sessions_meta.json)
+    meta = _read_sessions_meta()
+    for ent in meta:
+        # ent должен содержать: filename (basename или full path), api_id, api_hash, name
+        fname = ent.get("filename")
+        api_id = ent.get("api_id")
+        api_hash = ent.get("api_hash")
+        name = ent.get("name") or (os.path.splitext(os.path.basename(fname))[0] if fname else f"uploaded_{len(sessions)+1}")
+        if not fname or not api_id or not api_hash:
+            append_log(f"Неполная мета-запись сессии: {ent} — пропускаем")
+            continue
+        # если filename — относительный, считаем его внутри SESSIONS_UPLOAD_DIR
+        if not os.path.isabs(fname):
+            full = os.path.join(SESSIONS_UPLOAD_DIR, fname)
+        else:
+            full = fname
+        if not os.path.exists(full):
+            append_log(f"Файл сессии {full} не найден — пропускаем")
+            continue
+        sessions.append({"session_file": full, "api_id": str(api_id), "api_hash": str(api_hash), "name": name})
+
     if not sessions:
-        raise FileNotFoundError("Не найдены аккаунты в .env (SESSION_STRING_1/... или SESSIONS или SESSION_STRING)")
+        raise FileNotFoundError("Не найдены аккаунты: ни SESSION_STRING в env, ни загруженных .session (sessions_meta.json пуст).")
     return sessions
 
 
@@ -219,27 +277,57 @@ def load_sessions_from_env() -> List[Dict[str, str]]:
 # Telethon: создание клиентов
 # -------------------------
 async def create_clients(sessions: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Создаёт и подключает клиентов; возвращает список объектов {'name','client','authorized'}."""
+    """
+    Создаёт и подключает клиентов; возвращает список объектов {'name','client','authorized'}.
+    Поддерживает записи с 'session_string' и с 'session_file'.
+    """
     clients = []
     for s in sessions:
         name = s.get("name") or s.get("api_id")
-        session_string = s["session_string"]
-        api_id = int(s["api_id"]) if str(s["api_id"]).isdigit() else s["api_id"]
-        api_hash = s["api_hash"]
+        session_string = s.get("session_string")
+        session_file = s.get("session_file")
+        api_id = s.get("api_id")
+        api_hash = s.get("api_hash")
+        if api_id is None or api_hash is None:
+            append_log(f"create_clients: пропущен аккаунт {name} — нет api_id/api_hash")
+            continue
+        # преобразуем api_id к int если возможно
+        try:
+            api_id_val = int(api_id) if str(api_id).isdigit() else api_id
+        except Exception:
+            api_id_val = api_id
         append_log(f"Создаём клиент: {name}")
-        client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        try:
+            if session_file:
+                # используем путь к .session файлу
+                client = TelegramClient(session_file, api_id_val, api_hash)
+            else:
+                # используем StringSession
+                client = TelegramClient(StringSession(session_string), api_id_val, api_hash)
+        except Exception as e:
+            append_log(f"Ошибка создания TelegramClient для {name}: {e}")
+            # создаём заглушку client, добавляем как неавторизованный
+            clients.append({"name": name, "client": None, "authorized": False})
+            state["accounts_meta"].setdefault(name, {"last_action": f"create client error: {e}"})
+            continue
+
         try:
             await client.connect()
+            # Если используем session_file, Telethon, как правило, уже авторизовал пользователя (нет запроса коду)
             if not await client.is_user_authorized():
                 append_log(f"Аккаунт {name} не авторизован.")
-                await client.disconnect()
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
                 clients.append({"name": name, "client": client, "authorized": False})
                 state["accounts_meta"].setdefault(name, {"last_action": "not authorized"})
                 continue
             me = await client.get_me()
-            append_log(f"Клиент {name} авторизован как {getattr(me,'username', '')}")
+            uname = getattr(me, 'username', None)
+            append_log(f"Клиент {name} авторизован как {uname}")
             clients.append({"name": name, "client": client, "authorized": True})
-            state["accounts_meta"].setdefault(name, {"last_action": f"connected as {getattr(me,'username', '')}"})
+            state["accounts_meta"].setdefault(name, {"last_action": f"connected as {uname}"})
         except Exception as e:
             append_log(f"Ошибка подключения {name}: {e}")
             try:
@@ -285,7 +373,7 @@ async def leave_target_with_account(client: TelegramClient, target_key: str) -> 
 
 
 async def check_membership(client: TelegramClient, target_key: str) -> bool:
-    """Проверка членства: iter_participants (fallback)."""
+    """Проверка членства: используем iter_participants (работает для супергрупп/каналов)."""
     try:
         entity = await client.get_entity(target_key)
     except Exception as e:
@@ -419,9 +507,6 @@ async def notify_task_complete(task_type: str):
 
 # -------------------------
 # Worker implementations (subscribe / check / unsubscribe)
-# Каждая фаза создаёт worker'ы — по одному воркеру на аккаунт.
-# Каждый воркер хранит и обновляет свою позицию в state['positions_*'].
-# В случае cooldown воркер ждёт окончания (не увеличивая позицию), затем повторяет.
 # -------------------------
 async def _wait_for_cooldown_or_controls(acc_name: str):
     """Ожидание окончания cooldown для конкретного аккаунта.
@@ -451,7 +536,6 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
     """Worker для подписки от имени одного аккаунта."""
     name = account["name"]
     client = account["client"]
-    # если позиции не установлены — начать с 0
     pos = state["positions_subscribe"].get(name, 0)
     total = len(targets)
     append_log(f"worker_subscribe: {name} стартует с позиции {pos}/{total}")
@@ -483,6 +567,7 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
         res = await join_target_with_account(client, target)
         state["stats"]["attempted"] = state.get("stats", {}).get("attempted", 0) + 1
         append_log(f"{name}: Результат подписки: {res['info']}")
+
         # если RPCError с wait — выставляем cooldown и НЕ увеличиваем pos (повторим тот же target позже)
         if isinstance(res.get("info"), str) and res["info"].startswith("RPCError"):
             secs = parse_wait_seconds(res["info"])
@@ -505,7 +590,6 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
                 else:
                     # не увеличиваем pos — будем повторять после cooldown
                     state["positions_subscribe"][name] = pos
-                # уважать паузу/stop while waiting in next loop via cd
             else:
                 # неизвестная RPCError — помечаем как не участник и продолжаем
                 async with state["_lock"]:
@@ -532,18 +616,16 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
             state["positions_subscribe"][name] = pos
 
         # обновляем stats/WS
-        # пересчитываем approved
         async with state["_lock"]:
+            # пересчитываем approved (простая сумма)
             approved = 0
             for per in state["results"].values():
                 for v in per.values():
                     if v:
                         approved += 1
             state["stats"]["approved"] = approved
-            # subscribe_progress — % среднего пройденного по аккаунтам (оценка)
-            # для простоты считаем max progress: средняя позиции / total
+            # subscribe_progress — средняя позиция по аккаунтам
             try:
-                avg_pos = 0
                 accs = [n for n in state["positions_subscribe"].keys()]
                 if accs:
                     avg_pos = sum([state["positions_subscribe"].get(a, 0) for a in accs]) / len(accs)
@@ -615,7 +697,6 @@ async def worker_check(account: Dict[str, Any], targets: List[str]):
                         approved += 1
             state["stats"]["approved"] = approved
             try:
-                avg_pos = 0
                 accs = [n for n in state["positions_check"].keys()]
                 if accs:
                     avg_pos = sum([state["positions_check"].get(a, 0) for a in accs]) / len(accs)
@@ -675,7 +756,6 @@ async def worker_unsubscribe(account: Dict[str, Any], targets: List[str]):
                 state["positions_unsubscribe"][name] = pos
                 # добавить в pending
                 state["unsubscribe_pending"].setdefault(name, []).append(target)
-                # loop will wait next iteration
             else:
                 append_log(f"{name} получил entity error без явного времени при отписке от {target}. Пропускаем.")
                 state["positions_unsubscribe"][name] = pos + 1
@@ -697,8 +777,6 @@ async def worker_unsubscribe(account: Dict[str, Any], targets: List[str]):
 
 # -------------------------
 # Фазы: process_subscriptions, run_full_membership_check, process_unsubscribe
-# Они готовят список targets, создают клиентов, и запускают worker'ов (по одному на аккаунт),
-# затем ждут завершения всех worker'ов.
 # -------------------------
 async def process_subscriptions(pause_event: asyncio.Event, sessions_list: List[Dict[str, str]],
                                 targets_df: pd.DataFrame, subscribe_delay_min: float, subscribe_delay_max: float,
@@ -824,7 +902,6 @@ async def run_full_membership_check(ignore_pause: bool = False):
     total = len(targets)
     state["stats"]["total_targets"] = total
 
-    # обновляем задержки (оставляем существующие)
     # инициализируем позиции_check
     for c in clients:
         state["positions_check"].setdefault(c["name"], 0)
@@ -932,7 +1009,7 @@ async def process_unsubscribe(pause_event: asyncio.Event, sessions_list: List[Di
 
 
 # -------------------------
-# API / UI endpoints (unchanged интерфейсы)
+# API / UI endpoints
 # -------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -1024,12 +1101,6 @@ async def api_stop():
 async def api_check_now():
     if state.get("check_task") and not state["check_task"].done():
         return {"ok": False, "msg": "Проверка уже запущена"}
-    # пересоздаём позиции_check для всех аккаунтов только если их нет — иначе продолжаем с текущих позиций
-    try:
-        sessions = load_sessions_from_env()
-    except Exception:
-        sessions = []
-    # если clients пусты, will be created in run_full_membership_check
     state["check_task"] = asyncio.create_task(run_full_membership_check(ignore_pause=True))
     append_log("Немедленная проверка запущена в фоне.")
     broadcast_status()
@@ -1168,6 +1239,71 @@ async def api_progress():
 
 
 # -------------------------
+# Endpoints для загрузки/списка/удаления .session (UI)
+# -------------------------
+@app.post("/api/upload_session")
+async def api_upload_session(file: UploadFile = File(...), api_id: str = Form(...), api_hash: str = Form(...), name: str = Form(...)):
+    """
+    Загрузить .session файл.
+    Поля: file (.session), api_id, api_hash, name.
+    Сохранит файл в DATA_DIR/sessions/<original_filename> и мета-запись в sessions_meta.json.
+    """
+    # валидируем расширение
+    filename = file.filename or "uploaded.session"
+    if not filename.endswith(".session"):
+        # разрешаем также любые названия, но настоятельно рекомендовано .session
+        append_log(f"Загрузка файла сессии: предупреждение — файл не имеет расширения .session ({filename}).")
+    dest = os.path.join(SESSIONS_UPLOAD_DIR, filename)
+    # если файл с таким именем уже есть — добавляем суффикс
+    base, ext = os.path.splitext(filename)
+    i = 1
+    while os.path.exists(dest):
+        dest = os.path.join(SESSIONS_UPLOAD_DIR, f"{base}_{i}{ext}")
+        i += 1
+    # сохраняем файл
+    try:
+        content = await file.read()
+        with open(dest, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        append_log(f"Ошибка сохранения файла сессии: {e}")
+        return JSONResponse({"ok": False, "msg": f"Ошибка сохранения: {e}"}, status_code=500)
+    # обновляем meta
+    meta = _read_sessions_meta()
+    meta.append({"filename": os.path.basename(dest), "api_id": str(api_id), "api_hash": str(api_hash), "name": name})
+    _write_sessions_meta(meta)
+    append_log(f"Файл сессии загружен: {os.path.basename(dest)} (name={name})")
+    return {"ok": True, "msg": "Файл загружен"}
+
+
+@app.get("/api/list_uploaded_sessions")
+async def api_list_uploaded_sessions():
+    """Возвращает список загруженных .session из sessions_meta.json."""
+    meta = _read_sessions_meta()
+    return {"ok": True, "sessions": meta}
+
+
+@app.post("/api/delete_uploaded_session")
+async def api_delete_uploaded_session(filename: str = Form(...)):
+    """Удаляет загруженный файл и запись в meta (по basename)."""
+    meta = _read_sessions_meta()
+    new_meta = [m for m in meta if os.path.basename(m.get("filename", "")) != os.path.basename(filename)]
+    removed = len(meta) - len(new_meta)
+    if removed == 0:
+        return JSONResponse({"ok": False, "msg": "Не найдена запись в sessions_meta"}, status_code=404)
+    _write_sessions_meta(new_meta)
+    # удаляем файл
+    path = os.path.join(SESSIONS_UPLOAD_DIR, filename)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            append_log(f"Удалён загруженный файл сессии: {filename}")
+    except Exception as e:
+        append_log(f"Ошибка удаления файла сессии {filename}: {e}")
+    return {"ok": True, "removed": removed}
+
+
+# -------------------------
 # WebSocket endpoints (logs/status)
 # -------------------------
 @app.websocket("/ws/logs")
@@ -1272,7 +1408,7 @@ async def _self_ping_once(url: str, timeout: int = 10) -> Any:
 
 async def self_ping_loop(url: str, interval: int, stop_event: asyncio.Event, logger: Optional[Callable[[str], None]] = None):
     """
-    Асинхронный цикл pингования самого себя.
+    Асинхронный цикл пингования самого себя.
     stop_event — asyncio.Event, при set() цикл завершается.
     logger — функция для логов (append_log).
     """
@@ -1286,8 +1422,10 @@ async def self_ping_loop(url: str, interval: int, stop_event: asyncio.Event, log
         try:
             status, body = await _self_ping_once(url, timeout=10)
             logger(f"HTTP Request: GET {url} -> {status}")
+            append_log(f"HTTP Request: GET {url} -> {status}")
         except Exception as e:
             logger(f"Self-ping exception: {e}")
+            append_log(f"Self-ping exception: {e}")
         elapsed = time.time() - start
         to_wait = max(0, interval - elapsed)
         # ждём мелкими шагами, чтобы можно было прервать быстрее
@@ -1297,6 +1435,7 @@ async def self_ping_loop(url: str, interval: int, stop_event: asyncio.Event, log
             await asyncio.sleep(step)
             waited += step
     logger("Self-ping loop остановлен по stop_event.")
+    append_log("Self-ping loop остановлен по stop_event.")
 
 
 @app.on_event("startup")
@@ -1313,34 +1452,29 @@ async def startup_event():
         append_log("Self-ping отключён (SELF_PING_ENABLED=false или SELF_PING_URL не задан).")
 
 
-# -------------------------
-# Shutdown: корректно останавливаем self-ping и отключаем telethon-клиентов.
-# -------------------------
 @app.on_event("shutdown")
 async def shutdown_event():
-    append_log("Shutdown: останавливаем self-ping (если запущен) и отключаем клиентов...")
-    # останов self-ping
+    """При остановке приложения останавливаем self-ping."""
+    append_log("Shutdown: останавливаем фоновые таски...")
     try:
-        sp_stop = state.get("_self_ping_stop_event")
-        sp_task = state.get("_self_ping_task")
-        if sp_stop and isinstance(sp_stop, asyncio.Event):
-            sp_stop.set()
-            append_log("Self-ping stop event установлен.")
-        if sp_task and not sp_task.done():
+        if state.get("_self_ping_stop_event"):
+            state["_self_ping_stop_event"].set()
+        if state.get("_self_ping_task"):
             try:
-                sp_task.cancel()
+                await state["_self_ping_task"]
             except Exception:
                 pass
-            append_log("Self-ping таск отменён.")
-    except Exception as e:
-        append_log(f"Ошибка при остановке self-ping: {e}")
-
-    # отключаем telethon клиентов
+    except Exception:
+        pass
+    # здесь при необходимости можно корректно отключить telethon clients
     for c in state.get("clients", []):
-        client = c.get("client")
+        cl = c.get("client")
         try:
-            if client and client.is_connected():
-                await client.disconnect()
+            if cl:
+                await cl.disconnect()
         except Exception:
             pass
-    append_log("Shutdown завершён.")
+    append_log("Shutdown: завершено.")
+
+
+# EOF
