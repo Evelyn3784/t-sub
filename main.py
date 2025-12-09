@@ -1,17 +1,14 @@
 # main.py
 """
 Основной модуль FastAPI + Telethon.
-
-Изменения и возможности в этом файле:
-- Поддержка .session файлов: можно загружать .session через UI (/api/upload_session),
-  metadata сохраняется в DATA_DIR/sessions_meta.json и затем используются при создании клиентов.
-  Это позволяет использовать аккаунты без генерации string-session и ввода кода.
-- Сохранена поддержка session_string (StringSession) из .env (SESSION_STRING_1..., SESSIONS, SESSION_STRING).
-- Self-ping (автопинг) реализован: при старте, если в env включен SELF_PING_ENABLED и указан SELF_PING_URL,
-  запускается фоновой таск, который будет пинговать указанный URL.
-- WebSocket push для логов и статуса.
-- Все предыдущие функции подписки/проверки/отписки/позиции/cooldown сохранены.
-- Комментарии на русском языке.
+Обновлённая версия с:
+- поддержкой загрузки .session файлов и использования их копий (чтобы избежать sqlite locked),
+- автоматическим реконнектом аккаунта при ошибке "Cannot send requests while disconnected",
+- опцией включения/отключения отложенной проверки (membership_check_enabled),
+- self-ping (автопинг) для render,
+- WebSocket push для логов и статуса,
+- сохранением позиций для resume (subscribe/check/unsubscribe).
+Комментарии на русском языке.
 """
 
 import asyncio
@@ -20,11 +17,14 @@ import re
 import time
 import random
 import json
+import shutil
+import uuid
+import sqlite3
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set, Callable
 
 import requests
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Form, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -59,17 +59,7 @@ GOOD_TARGETS_FILE = os.path.join(DATA_DIR, "good_targets.csv")
 LOG_FILE = os.path.join(DATA_DIR, "logs.txt")
 LOG_MAX_LINES = 1000
 
-# -------------------------
-# Self-ping конфигурация (переменные окружения)
-# -------------------------
-# SELF_PING_ENABLED - true/false
-# SELF_PING_URL - URL, который будет пинговаться (например https://<app>.onrender.com/api/accounts_status)
-# SELF_PING_INTERVAL - интервал в секундах (рекомендуется >= 20)
-# -------------------------
-
-# -------------------------
-# Notifications config
-# -------------------------
+# Self-ping (SELF_PING_ENABLED, SELF_PING_URL, SELF_PING_INTERVAL)
 TELEGRAM_NOTIFICATIONS_ENABLED = os.getenv("TELEGRAM_NOTIFICATIONS_ENABLED", "false").lower() in ("1", "true", "yes")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -93,7 +83,7 @@ state: Dict[str, Any] = {
     "pause_event": asyncio.Event(),
     "stop_requested": False,
     "logs": [],
-    "clients": [],  # [{'name','client','authorized'}]
+    "clients": [],  # [{'name','client','authorized','session_copy'}]
     "stats": {"total_targets": 0, "attempted": 0, "approved": 0, "subscribe_progress": 0, "check_progress": 0},
     "results": {},  # results[target][account] = True/False
     "manager_log_ws": set(),
@@ -108,19 +98,19 @@ state: Dict[str, Any] = {
     "positions_subscribe": {},   # name -> idx
     "positions_check": {},       # name -> idx
     "positions_unsubscribe": {}, # name -> idx
-    # общая задержка между действиями (мин/макс)
+    # общая задержка между действиями (min/max)
     "_action_delay_min": 5.0,
     "_action_delay_max": 60.0,
-    # синхронизатор для доступа к results/good_targets
     "_lock": asyncio.Lock(),
-    # self-ping task и стоп-событие
+    # self-ping task and stop event
     "_self_ping_task": None,
     "_self_ping_stop_event": None,
+    # reconnect states
+    "needs_reconnect": {},   # name -> True
+    "reconnect_tasks": {},   # name -> task
 }
-# по умолчанию включаем pause_event
+# по умолчанию включаем pause_event (не в паузе)
 state["pause_event"].set()
-
-_last_pause_state = {"is_paused": False}
 
 # -------------------------
 # Utility: logging / broadcast
@@ -140,23 +130,23 @@ def append_log(msg: str, force_send: bool = False):
             f.write("\n".join(state["logs"]))
     except Exception:
         pass
-    # отправляем новым подключённым ws
+    # отправляем всем ws логам
     for ws in list(state["manager_log_ws"]):
         try:
             asyncio.create_task(ws.send_text(line))
         except Exception:
             pass
 
-
 def broadcast_status():
     """Отправляем status в /ws/status всем подключенным клиентам."""
     payload = {
         "running": bool(state["running_task"] and not state["running_task"].done()),
-        "check_running": bool(state.get("check_task") and not state["check_task"].done()),
-        "unsubscribe_running": bool(state.get("unsubscribe_task") and not state["unsubscribe_task"].done()),
+        "check_running": bool(state.get("check_task") and not state.get("check_task").done()),
+        "unsubscribe_running": bool(state.get("unsubscribe_task") and not state.get("unsubscribe_task").done()),
         "stats": state.get("stats", {}),
         "accounts_meta": state.get("accounts_meta", {}),
         "cooldowns": state.get("cooldowns", {}),
+        "needs_reconnect": state.get("needs_reconnect", {}),
     }
     for ws in list(state["manager_status_ws"]):
         try:
@@ -164,6 +154,79 @@ def broadcast_status():
         except Exception:
             pass
 
+# -------------------------
+# Reconnect helpers
+# -------------------------
+async def start_reconnect_for(name: str, client: TelegramClient):
+    """Запускает фоновую задачу по переподключению клиента (если ещё не запущена)."""
+    if not name:
+        return
+    if state.get("reconnect_tasks", {}).get(name):
+        return
+
+    async def _reconnect_loop():
+        append_log(f"Реконнект: начинаем попытки переподключения для {name}")
+        backoff = 1
+        while True:
+            if state.get("stop_requested"):
+                append_log(f"Реконнект {name}: отменён (stop_requested)")
+                break
+            try:
+                await client.connect()
+                await asyncio.sleep(0.3)
+                try:
+                    ok = await client.is_user_authorized()
+                except Exception as e_author:
+                    append_log(f"Реконнект {name}: is_user_authorized упал: {e_author}")
+                    ok = False
+                if ok:
+                    append_log(f"Реконнект {name}: успешно подключён и авторизован.")
+                    # обновляем запись о клиенте в state
+                    for c in state.get("clients", []):
+                        if c.get("name") == name:
+                            c["client"] = client
+                            c["authorized"] = True
+                            break
+                    state.get("needs_reconnect", {}).pop(name, None)
+                    break
+                else:
+                    append_log(f"Реконнект {name}: клиент подключился, но не авторизован. Ожидаем следующей попытки.")
+            except Exception as e:
+                append_log(f"Реконнект {name}: ошибка при connect: {e}")
+            await asyncio.sleep(min(60, backoff))
+            backoff = min(60, backoff * 2)
+
+        try:
+            state.get("reconnect_tasks", {}).pop(name, None)
+        except Exception:
+            pass
+
+    task = asyncio.create_task(_reconnect_loop())
+    state.setdefault("reconnect_tasks", {})[name] = task
+
+async def _wait_for_reauth_or_controls(acc_name: str):
+    """Ожидание восстановления авторизации для аккаунта. Возвращает True если восстановлено и можно продолжать."""
+    while True:
+        if state.get("stop_requested"):
+            return False
+        # уважать паузу
+        if not state["pause_event"].is_set():
+            while not state["pause_event"].is_set():
+                if state.get("stop_requested"):
+                    return False
+                await asyncio.sleep(0.5)
+        client_entry = next((c for c in state.get("clients", []) if c.get("name") == acc_name), None)
+        if client_entry and client_entry.get("authorized") and client_entry.get("client"):
+            try:
+                cl = client_entry.get("client")
+                try:
+                    if await cl.is_user_authorized():
+                        return True
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        await asyncio.sleep(2.0)
 
 # -------------------------
 # Helpers: files / env / sessions meta
@@ -174,9 +237,7 @@ def load_targets(path: str = TARGETS_FILE) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str).fillna("")
     return df
 
-
 def _read_sessions_meta() -> List[Dict[str, str]]:
-    """Читает sessions_meta.json если есть — возвращает список записей."""
     if not os.path.exists(SESSIONS_META_FILE):
         return []
     try:
@@ -188,21 +249,16 @@ def _read_sessions_meta() -> List[Dict[str, str]]:
     except Exception:
         return []
 
-
 def _write_sessions_meta(lst: List[Dict[str, str]]):
-    """Записывает мета-файл для загруженных сессий."""
     try:
         with open(SESSIONS_META_FILE, "w", encoding="utf-8") as f:
             json.dump(lst, f, ensure_ascii=False, indent=2)
     except Exception as e:
         append_log(f"Ошибка записи sessions_meta.json: {e}")
 
-
 def load_sessions_from_env() -> List[Dict[str, str]]:
     """
     Читаем сессии из env и из загруженных .session:
-    - поддерживаем SESSION_STRING_1/... и SESSIONS (многострочный) и SESSION_STRING (как ранее)
-    - дополняем список записями из sessions_meta.json (каждая запись должна содержать filename, api_id, api_hash, name).
     Возвращаем список элементов с полями:
       - либо {"session_string": "...", "api_id":"...", "api_hash":"...", "name":"..."}
       - либо {"session_file": "/full/path/to/file.session", "api_id":"...", "api_hash":"...", "name":"..."}
@@ -250,7 +306,6 @@ def load_sessions_from_env() -> List[Dict[str, str]]:
     # 4) Загруженные .session файлы (sessions_meta.json)
     meta = _read_sessions_meta()
     for ent in meta:
-        # ent должен содержать: filename (basename или full path), api_id, api_hash, name
         fname = ent.get("filename")
         api_id = ent.get("api_id")
         api_hash = ent.get("api_hash")
@@ -258,7 +313,6 @@ def load_sessions_from_env() -> List[Dict[str, str]]:
         if not fname or not api_id or not api_hash:
             append_log(f"Неполная мета-запись сессии: {ent} — пропускаем")
             continue
-        # если filename — относительный, считаем его внутри SESSIONS_UPLOAD_DIR
         if not os.path.isabs(fname):
             full = os.path.join(SESSIONS_UPLOAD_DIR, fname)
         else:
@@ -272,13 +326,37 @@ def load_sessions_from_env() -> List[Dict[str, str]]:
         raise FileNotFoundError("Не найдены аккаунты: ни SESSION_STRING в env, ни загруженных .session (sessions_meta.json пуст).")
     return sessions
 
+# -------------------------
+# Utility: create unique session copy (to avoid sqlite locked)
+# -------------------------
+def create_unique_session_copy(original_path: str) -> str:
+    """
+    Создаёт уникальную рабочую копию .session файла для текущего запуска.
+    Возвращает путь к копии.
+    """
+    try:
+        if not os.path.exists(original_path):
+            raise FileNotFoundError(original_path)
+        base = os.path.basename(original_path)
+        name, ext = os.path.splitext(base)
+        unique = f"{name}_{uuid.uuid4().hex}{ext or '.session'}"
+        dest = os.path.join(SESSIONS_UPLOAD_DIR, unique)
+        shutil.copy2(original_path, dest)
+        if os.path.exists(dest):
+            append_log(f"Создана копия сессии для запуска: {os.path.basename(dest)}")
+            return dest
+        else:
+            raise IOError("Не удалось создать копию сессии")
+    except Exception as e:
+        append_log(f"create_unique_session_copy: не удалось скопировать {original_path}: {e}")
+        raise
 
 # -------------------------
 # Telethon: создание клиентов
 # -------------------------
 async def create_clients(sessions: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     """
-    Создаёт и подключает клиентов; возвращает список объектов {'name','client','authorized'}.
+    Создаёт и подключает клиентов; возвращает список объектов {'name','client','authorized','session_copy'}.
     Поддерживает записи с 'session_string' и с 'session_file'.
     """
     clients = []
@@ -291,62 +369,121 @@ async def create_clients(sessions: List[Dict[str, str]]) -> List[Dict[str, Any]]
         if api_id is None or api_hash is None:
             append_log(f"create_clients: пропущен аккаунт {name} — нет api_id/api_hash")
             continue
-        # преобразуем api_id к int если возможно
         try:
             api_id_val = int(api_id) if str(api_id).isdigit() else api_id
         except Exception:
             api_id_val = api_id
         append_log(f"Создаём клиент: {name}")
+        client = None
+        session_copy_path = None
         try:
             if session_file:
-                # используем путь к .session файлу
-                client = TelegramClient(session_file, api_id_val, api_hash)
+                try:
+                    session_copy_path = create_unique_session_copy(session_file)
+                except Exception as e:
+                    append_log(f"Не удалось скопировать сессию {session_file} для {name}: {e}")
+                    session_copy_path = session_file  # fallback, риск conflict
+                client = TelegramClient(session_copy_path, api_id_val, api_hash)
             else:
-                # используем StringSession
                 client = TelegramClient(StringSession(session_string), api_id_val, api_hash)
         except Exception as e:
             append_log(f"Ошибка создания TelegramClient для {name}: {e}")
-            # создаём заглушку client, добавляем как неавторизованный
-            clients.append({"name": name, "client": None, "authorized": False})
+            clients.append({"name": name, "client": None, "authorized": False, "session_copy": session_copy_path})
             state["accounts_meta"].setdefault(name, {"last_action": f"create client error: {e}"})
             continue
 
         try:
             await client.connect()
-            # Если используем session_file, Telethon, как правило, уже авторизовал пользователя (нет запроса коду)
             if not await client.is_user_authorized():
                 append_log(f"Аккаунт {name} не авторизован.")
                 try:
                     await client.disconnect()
                 except Exception:
                     pass
-                clients.append({"name": name, "client": client, "authorized": False})
+                clients.append({"name": name, "client": client, "authorized": False, "session_copy": session_copy_path})
                 state["accounts_meta"].setdefault(name, {"last_action": "not authorized"})
                 continue
             me = await client.get_me()
             uname = getattr(me, 'username', None)
             append_log(f"Клиент {name} авторизован как {uname}")
-            clients.append({"name": name, "client": client, "authorized": True})
+            clients.append({"name": name, "client": client, "authorized": True, "session_copy": session_copy_path})
             state["accounts_meta"].setdefault(name, {"last_action": f"connected as {uname}"})
+        except sqlite3.OperationalError as oe:
+            append_log(f"Ошибка подключения {name}: sqlite OperationalError: {oe}")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            clients.append({"name": name, "client": client, "authorized": False, "session_copy": session_copy_path})
+            state["accounts_meta"].setdefault(name, {"last_action": f"sqlite error: {oe}"})
         except Exception as e:
             append_log(f"Ошибка подключения {name}: {e}")
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            clients.append({"name": name, "client": client, "authorized": False})
+            clients.append({"name": name, "client": client, "authorized": False, "session_copy": session_copy_path})
             state["accounts_meta"].setdefault(name, {"last_action": f"connect error: {e}"})
     return clients
 
+# -------------------------
+# Telethon actions: join/leave/check with robust reconnect handling
+# -------------------------
+async def ensure_client_connected(client: TelegramClient, name: str, max_retries: int = 3, delay_base: float = 1.0) -> bool:
+    """
+    Убедиться, что client подключён и авторизован. При sqlite 'database is locked' выполнять retry.
+    Возвращает True если клиент подключён и авторизован.
+    """
+    try:
+        if getattr(client, "is_connected", None) and client.is_connected():
+            try:
+                if await client.is_user_authorized():
+                    return True
+            except Exception:
+                pass
+        for attempt in range(1, max_retries + 1):
+            try:
+                await client.connect()
+                await asyncio.sleep(0.2)
+                if await client.is_user_authorized():
+                    return True
+                else:
+                    append_log(f"{name}: клиент подключился, но не авторизован.")
+                    return False
+            except sqlite3.OperationalError as e:
+                append_log(f"{name}: sqlite OperationalError при connect: {e} (attempt {attempt})")
+                await asyncio.sleep(delay_base * attempt)
+                continue
+            except Exception as e:
+                append_log(f"{name}: попытка connect #{attempt} не удалась: {e}")
+                await asyncio.sleep(delay_base * attempt)
+                continue
+        return False
+    except Exception as e:
+        append_log(f"{name}: ensure_client_connected исключение: {e}")
+        return False
 
-# -------------------------
-# Telethon actions: join/leave/check
-# -------------------------
-async def join_target_with_account(client: TelegramClient, target_key: str) -> Dict[str, Any]:
+async def join_target_with_account(client: TelegramClient, target_key: str, acc_name: str = "<acc>") -> Dict[str, Any]:
+    """Надёжный join с обработкой disconnect и sqlite locked."""
+    # Убедимся, что клиент подключён
+    ok = await ensure_client_connected(client, acc_name, max_retries=3)
+    if not ok:
+        return {"ok": False, "info": "entity error: Cannot send requests while disconnected"}
     try:
         entity = await client.get_entity(target_key)
     except Exception as e:
-        return {"ok": False, "info": f"entity error: {e}"}
+        msg = str(e)
+        if "disconnected" in msg.lower() or "cannot send requests" in msg.lower() or isinstance(e, sqlite3.OperationalError):
+            append_log(f"{acc_name}: get_entity упал ({e}) — попытаемся reconnect и повторить.")
+            try:
+                if await ensure_client_connected(client, acc_name, max_retries=2):
+                    entity = await client.get_entity(target_key)
+                else:
+                    return {"ok": False, "info": f"entity error: {e}"}
+            except Exception as ee:
+                return {"ok": False, "info": f"entity error: {ee}"}
+        else:
+            return {"ok": False, "info": f"entity error: {e}"}
     try:
         await client(JoinChannelRequest(entity))
         return {"ok": True, "info": "Join отправлен/выполнен"}
@@ -355,30 +492,86 @@ async def join_target_with_account(client: TelegramClient, target_key: str) -> D
     except ChannelPrivateError as e:
         return {"ok": False, "info": f"Приватный: {e}"}
     except RPCError as e:
+        msg = str(e)
+        if "disconnected" in msg.lower() or "cannot send requests" in msg.lower():
+            append_log(f"{acc_name}: JoinChannelRequest упал ({e}) — попробуем reconnect и retry.")
+            if await ensure_client_connected(client, acc_name, max_retries=2):
+                try:
+                    await client(JoinChannelRequest(entity))
+                    return {"ok": True, "info": "Join отправлен/выполнен (после reconnect)"}
+                except Exception as e2:
+                    return {"ok": False, "info": f"RPCError после повторной попытки: {e2}"}
         return {"ok": False, "info": f"RPCError: {e}"}
+    except sqlite3.OperationalError as e:
+        append_log(f"{acc_name}: sqlite OperationalError при join: {e}")
+        secs = 60
+        state["cooldowns"][acc_name] = time.time() + secs
+        return {"ok": False, "info": f"entity error: A wait of {secs} seconds is required (caused by sqlite database is locked)"}
     except Exception as e:
         return {"ok": False, "info": f"Ошибка join: {e}"}
 
-
-async def leave_target_with_account(client: TelegramClient, target_key: str) -> Dict[str, Any]:
+async def leave_target_with_account(client: TelegramClient, target_key: str, acc_name: str = "<acc>") -> Dict[str, Any]:
+    ok = await ensure_client_connected(client, acc_name, max_retries=3)
+    if not ok:
+        return {"ok": False, "info": "entity error: Cannot send requests while disconnected"}
     try:
         entity = await client.get_entity(target_key)
     except Exception as e:
-        return {"ok": False, "info": f"entity error: {e}"}
+        msg = str(e)
+        if "disconnected" in msg.lower() or "cannot send requests" in msg.lower() or isinstance(e, sqlite3.OperationalError):
+            append_log(f"{acc_name}: get_entity (leave) упал ({e}) — пробуем reconnect и повторить.")
+            try:
+                if await ensure_client_connected(client, acc_name, max_retries=2):
+                    entity = await client.get_entity(target_key)
+                else:
+                    return {"ok": False, "info": f"entity error: {e}"}
+            except Exception as ee:
+                return {"ok": False, "info": f"entity error: {ee}"}
+        else:
+            return {"ok": False, "info": f"entity error: {e}"}
     try:
         await client(LeaveChannelRequest(entity))
         return {"ok": True, "info": "Leave отправлен/выполнен"}
+    except sqlite3.OperationalError as e:
+        append_log(f"{acc_name}: sqlite OperationalError при leave: {e}")
+        secs = 60
+        state["cooldowns"][acc_name] = time.time() + secs
+        return {"ok": False, "info": f"entity error: A wait of {secs} seconds is required (caused by sqlite database is locked)"}
     except Exception as e:
+        msg = str(e)
+        if "disconnected" in msg.lower() or "cannot send requests" in msg.lower():
+            append_log(f"{acc_name}: LeaveChannelRequest упал ({e}) — пробуем reconnect и retry.")
+            if await ensure_client_connected(client, acc_name, max_retries=2):
+                try:
+                    await client(LeaveChannelRequest(entity))
+                    return {"ok": True, "info": "Leave отправлен/выполнен (после reconnect)"}
+                except Exception as e2:
+                    return {"ok": False, "info": f"Ошибка leave после retry: {e2}"}
         return {"ok": False, "info": f"Ошибка leave: {e}"}
 
-
-async def check_membership(client: TelegramClient, target_key: str) -> bool:
-    """Проверка членства: используем iter_participants (работает для супергрупп/каналов)."""
+async def check_membership(client: TelegramClient, target_key: str, acc_name: str = "<acc>") -> bool:
+    """Надёжная проверка членства с retry при disconnect/sqlite locked."""
+    ok = await ensure_client_connected(client, acc_name, max_retries=3)
+    if not ok:
+        append_log(f"{acc_name}: check_membership — клиент не подключён.")
+        return False
     try:
         entity = await client.get_entity(target_key)
     except Exception as e:
+        msg = str(e)
         append_log(f"check_membership: не удалось получить entity для {target_key}: {e}")
-        return False
+        if "disconnected" in msg.lower() or "cannot send requests" in msg.lower() or isinstance(e, sqlite3.OperationalError):
+            append_log(f"{acc_name}: check_membership — пробуем reconnect и повторный get_entity.")
+            if await ensure_client_connected(client, acc_name, max_retries=2):
+                try:
+                    entity = await client.get_entity(target_key)
+                except Exception as ee:
+                    append_log(f"{acc_name}: повторный get_entity не удался: {ee}")
+                    return False
+            else:
+                return False
+        else:
+            return False
     try:
         me = await client.get_me()
         my_id = getattr(me, "id", None)
@@ -395,9 +588,22 @@ async def check_membership(client: TelegramClient, target_key: str) -> bool:
         append_log(f"check_membership: пользователь (id={my_id}) НЕ найден в {target_key}")
         return False
     except Exception as e:
-        append_log(f"check_membership: iter_participants упал для {target_key}: {e}")
+        msg = str(e)
+        append_log(f"{acc_name}: check_membership: iter_participants упал для {target_key}: {e}")
+        if "disconnected" in msg.lower() or "cannot send requests" in msg.lower() or isinstance(e, sqlite3.OperationalError):
+            append_log(f"{acc_name}: check_membership — пробуем reconnect и повторить iter_participants.")
+            if await ensure_client_connected(client, acc_name, max_retries=2):
+                try:
+                    async for participant in client.iter_participants(entity):
+                        pid = getattr(participant, "id", None)
+                        if pid == my_id:
+                            append_log(f"check_membership: найден пользователь после retry (id={my_id}) в {target_key}")
+                            return True
+                    return False
+                except Exception as ee:
+                    append_log(f"{acc_name}: check_membership: retry упал: {ee}")
+                    return False
         return False
-
 
 # -------------------------
 # parse wait seconds
@@ -419,7 +625,6 @@ def parse_wait_seconds(msg: str) -> int:
             return 0
     return 0
 
-
 # -------------------------
 # Сохранение good_targets.csv (дополняет существующий файл)
 # -------------------------
@@ -434,7 +639,6 @@ async def save_good_targets(path: str = GOOD_TARGETS_FILE):
                 account_names = [s.get("name") or s.get("api_id") for s in sessions]
             except Exception:
                 account_names = []
-        # собираем новые цели, где по всем аккаунтам state['results'][t][acc] == True
         for target, per_acc in state.get("results", {}).items():
             if not account_names:
                 continue
@@ -445,7 +649,6 @@ async def save_good_targets(path: str = GOOD_TARGETS_FILE):
                     break
             if ok:
                 new_rows.add(target)
-
         existing: Set[str] = set()
         if os.path.exists(path):
             try:
@@ -454,11 +657,9 @@ async def save_good_targets(path: str = GOOD_TARGETS_FILE):
                     existing = set(df_old["target"].astype(str).tolist())
             except Exception:
                 existing = set()
-
         merged = sorted(existing.union(new_rows))
         pd.DataFrame([{"target": t} for t in merged]).to_csv(path, index=False, encoding="utf-8")
         append_log(f"good_targets.csv обновлён ({len(merged)} записей, добавлено {len(merged) - len(existing)} новых).")
-
 
 # -------------------------
 # Notifications (telegram/email)
@@ -479,7 +680,6 @@ async def notify_async(subject: str, body: str, telegram_text: Optional[str] = N
         except Exception as e:
             append_log(f"notify_async: ошибка отправки email: {e}")
 
-
 def _send_email_sync(subject: str, body: str):
     import smtplib, ssl
     from email.message import EmailMessage
@@ -494,7 +694,6 @@ def _send_email_sync(subject: str, body: str):
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.send_message(msg)
 
-
 async def notify_task_complete(task_type: str):
     try:
         st = state.get("stats", {})
@@ -504,14 +703,11 @@ async def notify_task_complete(task_type: str):
     except Exception as e:
         append_log(f"notify_task_complete: {e}")
 
-
 # -------------------------
 # Worker implementations (subscribe / check / unsubscribe)
 # -------------------------
-async def _wait_for_cooldown_or_controls(acc_name: str):
-    """Ожидание окончания cooldown для конкретного аккаунта.
-    Уважает глобальную pause/stop; возвращает True если завершилось нормально, False если stop_requested.
-    """
+async def _wait_for_cooldown_or_controls(acc_name: str) -> bool:
+    """Ожидание окончания cooldown для конкретного аккаунта."""
     while True:
         if state["stop_requested"]:
             return False
@@ -519,19 +715,17 @@ async def _wait_for_cooldown_or_controls(acc_name: str):
         until = state.get("cooldowns", {}).get(acc_name, 0)
         if now >= until:
             return True
-        # уважать паузу
         if not state["pause_event"].is_set():
-            append_log("Задача приостановлена (ожидание снятия паузы)...")
+            append_log("Задача приостановлена (ожидание возобновления)...")
             while not state["pause_event"].is_set():
                 if state["stop_requested"]:
                     return False
                 await asyncio.sleep(0.5)
             append_log("Пауза снята, продолжаем ожидание cooldown.")
-        # sleep небольшой шаг, чтобы проверять stop/pause часто
         to_sleep = min(1.0, max(0.5, until - now))
         await asyncio.sleep(to_sleep)
 
-
+# worker_subscribe with reconnect handling
 async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
     """Worker для подписки от имени одного аккаунта."""
     name = account["name"]
@@ -543,7 +737,6 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
         if state["stop_requested"]:
             append_log(f"worker_subscribe {name}: stop_requested, выходим.")
             break
-        # пауза
         while not state["pause_event"].is_set():
             append_log(f"worker_subscribe {name}: в паузе...")
             await asyncio.sleep(0.5)
@@ -551,7 +744,6 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
                 break
         if state["stop_requested"]:
             break
-        # проверяем cooldown
         now = time.time()
         cd = state.get("cooldowns", {}).get(name, 0)
         if now < cd:
@@ -559,47 +751,63 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
             ok = await _wait_for_cooldown_or_controls(name)
             if not ok:
                 break
-            continue  # после ожидания повторяем цикл и попробуем тот же pos
+            continue
 
         target = targets[pos]
         append_log(f"{name} -> попытка подписки на {target} ({pos+1}/{total})")
         state["accounts_meta"].setdefault(name, {})["last_action"] = f"join->{target}"
-        res = await join_target_with_account(client, target)
+        res = await join_target_with_account(client, target, name)
         state["stats"]["attempted"] = state.get("stats", {}).get("attempted", 0) + 1
-        append_log(f"{name}: Результат подписки: {res['info']}")
+        append_log(f"{name}: Результат подписки: {res.get('info')}")
 
-        # если RPCError с wait — выставляем cooldown и НЕ увеличиваем pos (повторим тот же target позже)
+        # Обработать disconnected -> запуск реконнекта и ожидание
+        info_lower = str(res.get("info", "")).lower()
+        if "cannot send requests while disconnected" in info_lower or "cannot send requests" in info_lower:
+            append_log(f"{name}: обнаружено 'Cannot send requests while disconnected' — запускаем реконнект и приостанавливаем работу аккаунта.")
+            state.setdefault("needs_reconnect", {})[name] = True
+            for ccie in state.get("clients", []):
+                if ccie.get("name") == name:
+                    ccie["authorized"] = False
+                    break
+            try:
+                await start_reconnect_for(name, client)
+            except Exception:
+                pass
+            ok_reauth = await _wait_for_reauth_or_controls(name)
+            if not ok_reauth:
+                append_log(f"{name}: реконнект не завершился — прерываем worker.")
+                break
+            append_log(f"{name}: реконнект завершён — продолжаем с позиции {pos}.")
+            state["positions_subscribe"][name] = pos
+            continue
+
+        # RPCError с wait -> cooldown
         if isinstance(res.get("info"), str) and res["info"].startswith("RPCError"):
             secs = parse_wait_seconds(res["info"])
             if secs > 0:
                 state["cooldowns"][name] = time.time() + secs
                 append_log(f"{name} помещён в cooldown на {secs}s из-за RPCError при подписке на {target}")
-                # проверяем всё равно членство — возможно уже участник
                 try:
-                    member = await check_membership(client, target)
+                    member = await check_membership(client, target, name)
                 except Exception:
                     member = False
                 async with state["_lock"]:
                     state["results"].setdefault(target, {})[name] = member
                 if member:
                     append_log(f"{name} уже участник {target}")
-                    # если успешно — можно увеличить позицию
                     pos += 1
                     state["positions_subscribe"][name] = pos
                     await save_good_targets()
                 else:
-                    # не увеличиваем pos — будем повторять после cooldown
                     state["positions_subscribe"][name] = pos
             else:
-                # неизвестная RPCError — помечаем как не участник и продолжаем
                 async with state["_lock"]:
                     state["results"].setdefault(target, {})[name] = False
                 state["positions_subscribe"][name] = pos + 1
                 pos += 1
         else:
-            # обычный путь: проверяем членство (может быть Immediate join или join sent)
             try:
-                member = await check_membership(client, target)
+                member = await check_membership(client, target, name)
             except Exception as e:
                 member = False
                 append_log(f"{name}: ошибка проверки после join: {e}")
@@ -609,22 +817,18 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
                 append_log(f"{name} — подтверждён как участник {target}")
             else:
                 append_log(f"{name} — не участник (заявка отправлена/ожидание) для {target}")
-            # сохраняем good_targets всегда после обновления
             await save_good_targets()
-            # продвигаем позицию
             pos += 1
             state["positions_subscribe"][name] = pos
 
-        # обновляем stats/WS
+        # обновляем статистику
         async with state["_lock"]:
-            # пересчитываем approved (простая сумма)
             approved = 0
             for per in state["results"].values():
                 for v in per.values():
                     if v:
                         approved += 1
             state["stats"]["approved"] = approved
-            # subscribe_progress — средняя позиция по аккаунтам
             try:
                 accs = [n for n in state["positions_subscribe"].keys()]
                 if accs:
@@ -634,7 +838,6 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
                 pass
         broadcast_status()
 
-        # задержка между действиями аккаунта
         delay = max(0.0, random.uniform(state.get("_action_delay_min", 5.0), state.get("_action_delay_max", 60.0)))
         try:
             await asyncio.sleep(delay)
@@ -645,9 +848,8 @@ async def worker_subscribe(account: Dict[str, Any], targets: List[str]):
     append_log(f"worker_subscribe {name}: завершился (позиция {pos}/{len(targets)})")
     state["positions_subscribe"][name] = pos
 
-
+# worker_check
 async def worker_check(account: Dict[str, Any], targets: List[str]):
-    """Worker проверки членства для одного аккаунта."""
     name = account["name"]
     client = account["client"]
     pos = state["positions_check"].get(name, 0)
@@ -676,7 +878,7 @@ async def worker_check(account: Dict[str, Any], targets: List[str]):
         append_log(f"{name} -> проверка членства в {target} ({pos+1}/{total})")
         state["accounts_meta"].setdefault(name, {})["last_action"] = f"check->{target}"
         try:
-            member = await check_membership(client, target)
+            member = await check_membership(client, target, name)
         except Exception as e:
             append_log(f"{name}: ошибка при check_membership {e}")
             member = False
@@ -686,10 +888,8 @@ async def worker_check(account: Dict[str, Any], targets: List[str]):
             append_log(f"{name} — участник {target}")
         else:
             append_log(f"{name} — НЕ участник {target}")
-        # обновляем good_targets и прогресс
         await save_good_targets()
         async with state["_lock"]:
-            # update approved
             approved = 0
             for per in state["results"].values():
                 for v in per.values():
@@ -715,9 +915,8 @@ async def worker_check(account: Dict[str, Any], targets: List[str]):
     append_log(f"worker_check {name}: завершился (позиция {pos}/{len(targets)})")
     state["positions_check"][name] = pos
 
-
+# worker_unsubscribe
 async def worker_unsubscribe(account: Dict[str, Any], targets: List[str]):
-    """Worker для отписки одного аккаунта (resume на позиции после cooldown)."""
     name = account["name"]
     client = account["client"]
     pos = state["positions_unsubscribe"].get(name, 0)
@@ -745,26 +944,39 @@ async def worker_unsubscribe(account: Dict[str, Any], targets: List[str]):
         target = targets[pos]
         append_log(f"{name} -> попытка отписки от {target} ({pos+1}/{total})")
         state["accounts_meta"].setdefault(name, {})["last_action"] = f"unsubscribe->{target}"
-        res = await leave_target_with_account(client, target)
+        res = await leave_target_with_account(client, target, name)
         append_log(f"{name}: Результат отписки: {res.get('info')}")
+        info_lower = str(res.get("info", "")).lower()
+        if "cannot send requests while disconnected" in info_lower or "cannot send requests" in info_lower:
+            append_log(f"{name}: при отписке получен disconnected — запускаем реконнект.")
+            state.setdefault("needs_reconnect", {})[name] = True
+            for ccie in state.get("clients", []):
+                if ccie.get("name") == name:
+                    ccie["authorized"] = False
+                    break
+            try:
+                await start_reconnect_for(name, client)
+            except Exception:
+                pass
+            ok_reauth = await _wait_for_reauth_or_controls(name)
+            if not ok_reauth:
+                append_log(f"{name}: реконнект не завершился — прерываем unsubscribe worker.")
+                break
+            append_log(f"{name}: реконнект завершён — продолжаем отписку с позиции {pos}.")
+            state["positions_unsubscribe"][name] = pos
+            continue
         if isinstance(res.get("info"), str) and res["info"].startswith("entity error"):
-            secs = parse_wait_seconds(res["info"])
+            secs = parse_wait_seconds(res.get("info"))
             if secs > 0:
                 state["cooldowns"][name] = time.time() + secs
                 append_log(f"{name} помещён в cooldown на {secs}s из-за entity error при отписке от {target}.")
-                # не увеличиваем позицию — повторим после cooldown
                 state["positions_unsubscribe"][name] = pos
-                # добавить в pending
-                state["unsubscribe_pending"].setdefault(name, []).append(target)
             else:
-                append_log(f"{name} получил entity error без явного времени при отписке от {target}. Пропускаем.")
                 state["positions_unsubscribe"][name] = pos + 1
                 pos += 1
         else:
-            # успешная отписка или другое
             state["positions_unsubscribe"][name] = pos + 1
             pos += 1
-        # задержка
         delay = max(0.0, random.uniform(state.get("_action_delay_min", 5.0), state.get("_action_delay_max", 60.0)))
         try:
             await asyncio.sleep(delay)
@@ -774,29 +986,25 @@ async def worker_unsubscribe(account: Dict[str, Any], targets: List[str]):
     append_log(f"worker_unsubscribe {name}: завершился (позиция {pos}/{len(targets)})")
     state["positions_unsubscribe"][name] = pos
 
-
 # -------------------------
 # Фазы: process_subscriptions, run_full_membership_check, process_unsubscribe
 # -------------------------
 async def process_subscriptions(pause_event: asyncio.Event, sessions_list: List[Dict[str, str]],
                                 targets_df: pd.DataFrame, subscribe_delay_min: float, subscribe_delay_max: float,
-                                membership_check_minutes: int):
+                                membership_check_minutes: int, membership_check_enabled: bool = True):
     """Организует фазу подписки — запускает worker'ов для каждого аккаунта."""
     append_log("=== Начало задания: Подписаться ===")
     state["stop_requested"] = False
-    # targets list
     targets = []
     for _, row in targets_df.iterrows():
         key = row.get("username") or row.get("id") or row.get("title")
         if key:
             targets.append(key)
             state["results"].setdefault(key, {})
-
     total = len(targets)
     state["stats"].update({"total_targets": total, "attempted": 0, "approved": 0, "subscribe_progress": 0})
     broadcast_status()
 
-    # создаём клиентов
     clients_info = await create_clients(sessions_list)
     clients = [c for c in clients_info if c.get("authorized")]
     state["clients"] = clients
@@ -806,26 +1014,21 @@ async def process_subscriptions(pause_event: asyncio.Event, sessions_list: List[
 
     append_log(f"Аккаунты в работе: {', '.join([c['name'] for c in clients])}")
 
-    # создаём пустой good_targets если нет
     if not os.path.exists(GOOD_TARGETS_FILE):
         pd.DataFrame([]).to_csv(GOOD_TARGETS_FILE, index=False, encoding="utf-8")
         append_log("good_targets.csv создан (пустой).")
 
-    # обновляем общие задержки
     state["_action_delay_min"] = float(subscribe_delay_min)
     state["_action_delay_max"] = float(subscribe_delay_max)
 
-    # инициализируем позиции для аккаунтов (если не установлены)
     for c in clients:
         state["positions_subscribe"].setdefault(c["name"], 0)
 
-    # запускаем worker'ы
     tasks = []
     for c in clients:
         t = asyncio.create_task(worker_subscribe(c, targets))
         tasks.append(t)
 
-    # ждём завершения всех worker'ов
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -834,22 +1037,25 @@ async def process_subscriptions(pause_event: asyncio.Event, sessions_list: List[
         append_log(f"process_subscriptions: ошибка gather: {e}")
 
     append_log("Фаза подписки завершена.")
-    # планируем отложенную проверку согласно membership_check_minutes (UI)
-    if state.get("scheduled_check_task"):
-        try:
-            prev = state["scheduled_check_task"]
-            if prev and not prev.done():
-                prev.cancel()
-        except Exception:
-            pass
-    state["scheduled_check_task"] = asyncio.create_task(_schedule_check_after_minutes(membership_check_minutes))
-    append_log(f"Отложенная проверка запланирована через {membership_check_minutes} минут.")
+    # планируем отложенную проверку только если включено
+    if membership_check_enabled:
+        if state.get("scheduled_check_task"):
+            try:
+                prev = state["scheduled_check_task"]
+                if prev and not prev.done():
+                    prev.cancel()
+            except Exception:
+                pass
+        state["scheduled_check_task"] = asyncio.create_task(_schedule_check_after_minutes(membership_check_minutes))
+        append_log(f"Отложенная проверка запланирована через {membership_check_minutes} минут.")
+    else:
+        append_log("Отложенная проверка отключена (membership_check_enabled=False).")
     broadcast_status()
-    await notify_task_complete("subscribe")
-
+    if NOTIFY_ON_SUBSCRIBE_COMPLETE:
+        await notify_task_complete("subscribe")
 
 async def _schedule_check_after_minutes(minutes: int):
-    """Вспомогательная функция для отложенной проверки (корректно ресчёт минут)."""
+    """Вспомогательная функция для отложенной проверки."""
     if minutes <= 0:
         append_log("Отложенная проверка: minutes<=0 — запускаем немедленно.")
         await run_full_membership_check()
@@ -863,13 +1069,10 @@ async def _schedule_check_after_minutes(minutes: int):
     append_log("Отложенная проверка: время пришло, запускаем run_full_membership_check.")
     await run_full_membership_check()
 
-
 async def run_full_membership_check(ignore_pause: bool = False):
-    """Запускает проверку членства: создаёт worker'ов по аккаунтам и запускает их."""
     append_log("Запущена полная проверка членства (run_full_membership_check).")
     state["stop_requested"] = False
 
-    # создаём клиентов, если их нет в state
     if not state.get("clients"):
         append_log("Нет подключённых клиентов в памяти — создаём клиентов из .env для проверки.")
         try:
@@ -886,7 +1089,6 @@ async def run_full_membership_check(ignore_pause: bool = False):
     else:
         clients = state.get("clients")
 
-    # targets
     try:
         df = load_targets()
         targets = []
@@ -902,16 +1104,13 @@ async def run_full_membership_check(ignore_pause: bool = False):
     total = len(targets)
     state["stats"]["total_targets"] = total
 
-    # инициализируем позиции_check
     for c in clients:
         state["positions_check"].setdefault(c["name"], 0)
 
-    # создаём worker'ы
     tasks = []
     for c in clients:
         tasks.append(asyncio.create_task(worker_check(c, targets)))
 
-    # ждём завершения
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -920,14 +1119,12 @@ async def run_full_membership_check(ignore_pause: bool = False):
         append_log(f"run_full_membership_check: ошибка gather: {e}")
 
     append_log("Полная проверка членства завершена.")
-    # обновим good_targets один раз в конце (и уже обновления делались в worker'ах)
     await save_good_targets()
-    await notify_task_complete("check")
+    if NOTIFY_ON_CHECK_COMPLETE:
+        await notify_task_complete("check")
     broadcast_status()
 
-
 async def process_unsubscribe(pause_event: asyncio.Event, sessions_list: List[Dict[str, str]], targets_df: pd.DataFrame):
-    """Организует массовую отписку: стартует worker'ы для каждого аккаунта."""
     append_log("=== Начало задания: Отписаться (Unsubscribe) ===")
     state["stop_requested"] = False
 
@@ -961,7 +1158,6 @@ async def process_unsubscribe(pause_event: asyncio.Event, sessions_list: List[Di
     except Exception as e:
         append_log(f"process_unsubscribe: ошибка gather: {e}")
 
-    # обработка pending (повторные попытки)
     append_log("Первичный проход по targets завершён. Обработка pending...")
     try:
         while True:
@@ -991,12 +1187,11 @@ async def process_unsubscribe(pause_event: asyncio.Event, sessions_list: List[Di
                 target = pending_list.pop(0)
                 append_log(f"{name} -> повторная попытка отписки от {target}")
                 try:
-                    res = await leave_target_with_account(client_entry["client"], target)
+                    res = await leave_target_with_account(client_entry["client"], target, name)
                     append_log(f"{name}: результат повторной отписки: {res.get('info')}")
                 except Exception as e:
                     append_log(f"{name}: исключение при повторной отписке: {e}")
                 made_progress = True
-                # задержка
                 delay = max(0.0, random.uniform(state.get("_action_delay_min", 5.0), state.get("_action_delay_max", 60.0)))
                 await asyncio.sleep(delay)
             if not made_progress:
@@ -1004,9 +1199,9 @@ async def process_unsubscribe(pause_event: asyncio.Event, sessions_list: List[Di
     except asyncio.CancelledError:
         append_log("process_unsubscribe: cancelled during pending processing.")
     append_log("Задача отписки завершена.")
+    if NOTIFY_ON_UNSUBSCRIBE_COMPLETE:
+        await notify_task_complete("unsubscribe")
     broadcast_status()
-    await notify_task_complete("unsubscribe")
-
 
 # -------------------------
 # API / UI endpoints
@@ -1023,14 +1218,13 @@ async def index(request: Request):
         scount = 0
     return templates.TemplateResponse("index.html", {"request": request, "targets_count": tcount, "sessions_count": scount})
 
-
 @app.post("/api/start")
 async def api_start(per_account_delay_min: float = Form(5.0),
                     per_account_delay_max: float = Form(60.0),
-                    membership_check_minutes: int = Form(60)):
+                    membership_check_minutes: int = Form(60),
+                    membership_check_enabled: int = Form(1)):
     """
-    Запуск подписки. Значения задержек применяются глобально для всех фаз.
-    membership_check_minutes — отложенная проверка в минутах.
+    Запуск подписки. membership_check_enabled: 1 или 0.
     """
     if per_account_delay_min < 0:
         per_account_delay_min = 0.0
@@ -1038,7 +1232,6 @@ async def api_start(per_account_delay_min: float = Form(5.0),
         per_account_delay_max = per_account_delay_min
     state["_action_delay_min"] = float(per_account_delay_min)
     state["_action_delay_max"] = float(per_account_delay_max)
-
     if state["running_task"] and not state["running_task"].done():
         return JSONResponse({"ok": False, "msg": "Задача уже запущена"}, status_code=400)
     try:
@@ -1055,6 +1248,7 @@ async def api_start(per_account_delay_min: float = Form(5.0),
     state["pause_event"].set()
     state["stop_requested"] = False
 
+    membership_check_enabled_bool = (int(membership_check_enabled) == 1)
     state["running_task"] = asyncio.create_task(process_subscriptions(
         pause_event=state["pause_event"],
         sessions_list=sessions,
@@ -1062,11 +1256,11 @@ async def api_start(per_account_delay_min: float = Form(5.0),
         subscribe_delay_min=per_account_delay_min,
         subscribe_delay_max=per_account_delay_max,
         membership_check_minutes=int(membership_check_minutes),
+        membership_check_enabled=membership_check_enabled_bool,
     ))
     append_log("Фоновая задача подписки запущена.")
     broadcast_status()
     return {"ok": True, "msg": "Задача подписки запущена"}
-
 
 @app.post("/api/pause")
 async def api_pause():
@@ -1076,7 +1270,6 @@ async def api_pause():
     broadcast_status()
     return {"ok": True}
 
-
 @app.post("/api/resume")
 async def api_resume():
     if not state["running_task"] or state["running_task"].done():
@@ -1084,7 +1277,6 @@ async def api_resume():
     state["pause_event"].set()
     broadcast_status()
     return {"ok": True}
-
 
 @app.post("/api/stop")
 async def api_stop():
@@ -1096,16 +1288,14 @@ async def api_stop():
     broadcast_status()
     return {"ok": True}
 
-
 @app.post("/api/check_now")
 async def api_check_now():
-    if state.get("check_task") and not state["check_task"].done():
+    if state.get("check_task") and not state.get("check_task").done():
         return {"ok": False, "msg": "Проверка уже запущена"}
     state["check_task"] = asyncio.create_task(run_full_membership_check(ignore_pause=True))
     append_log("Немедленная проверка запущена в фоне.")
     broadcast_status()
     return {"ok": True, "msg": "Немедленная проверка запущена"}
-
 
 @app.post("/api/stop_check")
 async def api_stop_check():
@@ -1124,10 +1314,9 @@ async def api_stop_check():
     broadcast_status()
     return {"ok": True}
 
-
 @app.post("/api/unsubscribe")
 async def api_unsubscribe():
-    if state.get("unsubscribe_task") and not state["unsubscribe_task"].done():
+    if state.get("unsubscribe_task") and not state.get("unsubscribe_task").done():
         return {"ok": False, "msg": "Задача отписки уже запущена"}
     try:
         targets_df = load_targets()
@@ -1137,7 +1326,6 @@ async def api_unsubscribe():
         sessions = load_sessions_from_env()
     except Exception as e:
         return JSONResponse({"ok": False, "msg": f"Ошибка загрузки аккаунтов: {e}"}, status_code=400)
-
     state["stop_requested"] = False
     state["unsubscribe_task"] = asyncio.create_task(process_unsubscribe(
         pause_event=state["pause_event"],
@@ -1147,7 +1335,6 @@ async def api_unsubscribe():
     append_log("Задача отписки запущена в фоне.")
     broadcast_status()
     return {"ok": True}
-
 
 @app.post("/api/stop_unsubscribe")
 async def api_stop_unsubscribe():
@@ -1166,21 +1353,18 @@ async def api_stop_unsubscribe():
     broadcast_status()
     return {"ok": True}
 
-
 @app.get("/api/logs")
 async def api_get_logs():
     return {"logs": state["logs"]}
-
 
 @app.get("/api/status")
 async def api_get_status():
     return {
         "running": bool(state["running_task"] and not state["running_task"].done()),
-        "check_running": bool(state.get("check_task") and not state["check_task"].done()),
-        "unsubscribe_running": bool(state.get("unsubscribe_task") and not state["unsubscribe_task"].done()),
+        "check_running": bool(state.get("check_task") and not state.get("check_task").done()),
+        "unsubscribe_running": bool(state.get("unsubscribe_task") and not state.get("unsubscribe_task").done()),
         "stats": state.get("stats", {})
     }
-
 
 @app.get("/api/accounts_status")
 async def api_accounts_status():
@@ -1197,9 +1381,9 @@ async def api_accounts_status():
         cd_until = state.get("cooldowns", {}).get(name, 0)
         cooldown_remaining = max(0, int(cd_until - now))
         last_action = state.get("accounts_meta", {}).get(name, {}).get("last_action", "")
-        accounts.append({"name": name, "authorized": authorized, "cooldown_remaining": cooldown_remaining, "last_action": last_action})
+        needs_reconnect = bool(state.get("needs_reconnect", {}).get(name, False))
+        accounts.append({"name": name, "authorized": authorized, "cooldown_remaining": cooldown_remaining, "last_action": last_action, "needs_reconnect": needs_reconnect})
     return {"accounts": accounts}
-
 
 @app.get("/download/good_targets")
 async def download_good_targets():
@@ -1208,16 +1392,14 @@ async def download_good_targets():
         append_log("good_targets.csv не найден — создан пустой файл для скачивания.")
     return FileResponse(GOOD_TARGETS_FILE, media_type="text/csv", filename="good_targets.csv")
 
-
 @app.post("/api/clear_good_targets")
-async def api_clear_good_targets(confirm: bool = Form(False)):
+async def api_clear_good_targets(confirm: int = Form(0)):
     try:
         pd.DataFrame([]).to_csv(GOOD_TARGETS_FILE, index=False, encoding="utf-8")
         append_log("good_targets.csv очищен по запросу пользователя.")
         return {"ok": True}
     except Exception as e:
         return JSONResponse({"ok": False, "msg": f"Ошибка очистки: {e}"}, status_code=500)
-
 
 @app.get("/api/progress")
 async def api_progress():
@@ -1237,7 +1419,6 @@ async def api_progress():
     results = state.get("results", {})
     return {"accounts": account_names, "targets": targets, "results": results, "stats": state.get("stats", {})}
 
-
 # -------------------------
 # Endpoints для загрузки/списка/удаления .session (UI)
 # -------------------------
@@ -1248,19 +1429,15 @@ async def api_upload_session(file: UploadFile = File(...), api_id: str = Form(..
     Поля: file (.session), api_id, api_hash, name.
     Сохранит файл в DATA_DIR/sessions/<original_filename> и мета-запись в sessions_meta.json.
     """
-    # валидируем расширение
     filename = file.filename or "uploaded.session"
     if not filename.endswith(".session"):
-        # разрешаем также любые названия, но настоятельно рекомендовано .session
         append_log(f"Загрузка файла сессии: предупреждение — файл не имеет расширения .session ({filename}).")
     dest = os.path.join(SESSIONS_UPLOAD_DIR, filename)
-    # если файл с таким именем уже есть — добавляем суффикс
     base, ext = os.path.splitext(filename)
     i = 1
     while os.path.exists(dest):
         dest = os.path.join(SESSIONS_UPLOAD_DIR, f"{base}_{i}{ext}")
         i += 1
-    # сохраняем файл
     try:
         content = await file.read()
         with open(dest, "wb") as f:
@@ -1268,31 +1445,31 @@ async def api_upload_session(file: UploadFile = File(...), api_id: str = Form(..
     except Exception as e:
         append_log(f"Ошибка сохранения файла сессии: {e}")
         return JSONResponse({"ok": False, "msg": f"Ошибка сохранения: {e}"}, status_code=500)
-    # обновляем meta
     meta = _read_sessions_meta()
     meta.append({"filename": os.path.basename(dest), "api_id": str(api_id), "api_hash": str(api_hash), "name": name})
     _write_sessions_meta(meta)
     append_log(f"Файл сессии загружен: {os.path.basename(dest)} (name={name})")
     return {"ok": True, "msg": "Файл загружен"}
 
-
 @app.get("/api/list_uploaded_sessions")
 async def api_list_uploaded_sessions():
-    """Возвращает список загруженных .session из sessions_meta.json."""
     meta = _read_sessions_meta()
+    # добавим exists флаг
+    for m in meta:
+        fname = m.get("filename")
+        if fname:
+            path = os.path.join(SESSIONS_UPLOAD_DIR, fname)
+            m["exists"] = os.path.exists(path)
     return {"ok": True, "sessions": meta}
-
 
 @app.post("/api/delete_uploaded_session")
 async def api_delete_uploaded_session(filename: str = Form(...)):
-    """Удаляет загруженный файл и запись в meta (по basename)."""
     meta = _read_sessions_meta()
     new_meta = [m for m in meta if os.path.basename(m.get("filename", "")) != os.path.basename(filename)]
     removed = len(meta) - len(new_meta)
     if removed == 0:
         return JSONResponse({"ok": False, "msg": "Не найдена запись в sessions_meta"}, status_code=404)
     _write_sessions_meta(new_meta)
-    # удаляем файл
     path = os.path.join(SESSIONS_UPLOAD_DIR, filename)
     try:
         if os.path.exists(path):
@@ -1301,7 +1478,6 @@ async def api_delete_uploaded_session(filename: str = Form(...)):
     except Exception as e:
         append_log(f"Ошибка удаления файла сессии {filename}: {e}")
     return {"ok": True, "removed": removed}
-
 
 # -------------------------
 # WebSocket endpoints (logs/status)
@@ -1326,7 +1502,6 @@ async def websocket_logs(ws: WebSocket):
     finally:
         state["manager_log_ws"].discard(ws)
 
-
 @app.websocket("/ws/status")
 async def websocket_status(ws: WebSocket):
     await ws.accept()
@@ -1341,11 +1516,12 @@ async def websocket_status(ws: WebSocket):
                 await asyncio.sleep(2.0)
                 payload = {
                     "running": bool(state["running_task"] and not state["running_task"].done()),
-                    "check_running": bool(state.get("check_task") and not state["check_task"].done()),
-                    "unsubscribe_running": bool(state.get("unsubscribe_task") and not state["unsubscribe_task"].done()),
+                    "check_running": bool(state.get("check_task") and not state.get("check_task").done()),
+                    "unsubscribe_running": bool(state.get("unsubscribe_task") and not state.get("unsubscribe_task").done()),
                     "stats": state.get("stats", {}),
                     "accounts_meta": state.get("accounts_meta", {}),
                     "cooldowns": state.get("cooldowns", {}),
+                    "needs_reconnect": state.get("needs_reconnect", {}),
                 }
                 await ws.send_json(payload)
             except WebSocketDisconnect:
@@ -1356,7 +1532,6 @@ async def websocket_status(ws: WebSocket):
     finally:
         state["manager_status_ws"].discard(ws)
 
-
 # -------------------------
 # Health & logs export
 # -------------------------
@@ -1366,7 +1541,6 @@ async def health_check():
         return JSONResponse({"ok": True, "running": bool(state["running_task"] and not state["running_task"].done())})
     except Exception:
         return JSONResponse({"ok": True})
-
 
 @app.get("/api/export_logs")
 async def api_export_logs():
@@ -1380,12 +1554,10 @@ async def api_export_logs():
     else:
         return JSONResponse({"ok": False, "msg": "Лог файл не найден"}, status_code=404)
 
-
 # -------------------------
-# Self-ping: реализация и интеграция в lifecycle
+# Self-ping
 # -------------------------
 def read_self_ping_config():
-    """Читает конфигурацию self-ping из переменных окружения."""
     enabled = os.getenv("SELF_PING_ENABLED", "false").lower() in ("1", "true", "yes")
     url = os.getenv("SELF_PING_URL", "") or None
     try:
@@ -1394,9 +1566,7 @@ def read_self_ping_config():
         interval = 300
     return enabled, url, max(1, interval)
 
-
 async def _self_ping_once(url: str, timeout: int = 10) -> Any:
-    """Выполнить один GET-запрос к url в thread pool и вернуть (status, text_or_error)."""
     def _req():
         try:
             r = requests.get(url, timeout=timeout)
@@ -1405,17 +1575,10 @@ async def _self_ping_once(url: str, timeout: int = 10) -> Any:
             return ("error", str(e))
     return await asyncio.to_thread(_req)
 
-
 async def self_ping_loop(url: str, interval: int, stop_event: asyncio.Event, logger: Optional[Callable[[str], None]] = None):
-    """
-    Асинхронный цикл пингования самого себя.
-    stop_event — asyncio.Event, при set() цикл завершается.
-    logger — функция для логов (append_log).
-    """
     if logger is None:
         def logger(x): print(x)
     logger(f"Self-ping loop стартует: url={url}, interval={interval}s")
-    # небольшой jitter перед стартом
     await asyncio.sleep(min(interval, 1.0))
     while not stop_event.is_set():
         start = time.time()
@@ -1428,7 +1591,6 @@ async def self_ping_loop(url: str, interval: int, stop_event: asyncio.Event, log
             append_log(f"Self-ping exception: {e}")
         elapsed = time.time() - start
         to_wait = max(0, interval - elapsed)
-        # ждём мелкими шагами, чтобы можно было прервать быстрее
         waited = 0.0
         while waited < to_wait and not stop_event.is_set():
             step = min(1.0, to_wait - waited)
@@ -1437,10 +1599,8 @@ async def self_ping_loop(url: str, interval: int, stop_event: asyncio.Event, log
     logger("Self-ping loop остановлен по stop_event.")
     append_log("Self-ping loop остановлен по stop_event.")
 
-
 @app.on_event("startup")
 async def startup_event():
-    """При старте приложения — запускаем self-ping при необходимости."""
     append_log("Startup: приложение запустилось, проверяем self-ping конфигурацию...")
     enabled, url, interval = read_self_ping_config()
     if enabled and url:
@@ -1451,10 +1611,8 @@ async def startup_event():
     else:
         append_log("Self-ping отключён (SELF_PING_ENABLED=false или SELF_PING_URL не задан).")
 
-
 @app.on_event("shutdown")
 async def shutdown_event():
-    """При остановке приложения останавливаем self-ping."""
     append_log("Shutdown: останавливаем фоновые таски...")
     try:
         if state.get("_self_ping_stop_event"):
@@ -1466,7 +1624,6 @@ async def shutdown_event():
                 pass
     except Exception:
         pass
-    # здесь при необходимости можно корректно отключить telethon clients
     for c in state.get("clients", []):
         cl = c.get("client")
         try:
@@ -1474,7 +1631,13 @@ async def shutdown_event():
                 await cl.disconnect()
         except Exception:
             pass
+        copy_path = c.get("session_copy") or getattr(cl, "_session_file_copy", None)
+        if copy_path and os.path.exists(copy_path):
+            try:
+                os.remove(copy_path)
+                append_log(f"Удалена временная копия сессии: {os.path.basename(copy_path)}")
+            except Exception:
+                pass
     append_log("Shutdown: завершено.")
-
 
 # EOF

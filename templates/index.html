@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Telegram MassJoin / Manager</title>
+  <title>Telegram MassJoin — Управление</title>
   <link rel="stylesheet" href="/static/style.css" />
   <style>
-    /* Простейшая стилизация — вы можете заменить style.css */
+    /* Простая встроенная стилизация для быстрого старта */
     body { font-family: Inter, Arial, sans-serif; margin: 12px; background:#f6f7fb; color:#222; }
     h2 { margin: 6px 0 12px 0; }
     .grid { display: grid; grid-template-columns: 420px 1fr; gap: 12px; align-items: start; }
@@ -41,7 +41,10 @@
 
       <label>Отложенная проверка (минуты)</label>
       <input id="check_minutes" type="number" value="60" min="0" />
-      <div class="small">Через сколько минут после завершения фазы «Подписаться» будет запущена проверка (0 — немедленно).</div>
+      <div style="margin-top:6px;">
+        <label><input type="checkbox" id="enable_scheduled_check" checked /> Включить отложенную проверку</label>
+      </div>
+      <div class="small">Если чекбокс снят — отложенная проверка после фазы Подписки не будет планироваться.</div>
 
       <div class="controls" style="margin-top:10px;">
         <button id="btnStart">Запустить Подписку</button>
